@@ -9,7 +9,7 @@ import { parseBRL } from "@/lib/format";
 import { decodeCsvBytes, parseTransactionsCsv } from "@/lib/csv";
 import { GOOGLE_SCOPES } from "@/lib/gmail/oauth";
 import { createAdminClient } from "@/lib/supabase/admin";
-import { renewGmailWatch, syncGmailConnection } from "@/lib/gmail/sync";
+import { renewGmailWatch, syncGmailConnection, validateGmailConnection } from "@/lib/gmail/sync";
 import type { GmailConnection } from "@/lib/gmail/google";
 import { addMonthsToDate, allocateInstallmentShares, splitInstallments } from "@/lib/transactions";
 
@@ -28,6 +28,25 @@ function fail(message: string): never {
 
 function check(error: { message: string } | null, context: string) {
   if (error) fail(`${context}: ${error.message}`);
+}
+
+function gmailErrorReason(error: unknown) {
+  const message = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
+  if (message.includes("credenciais oauth") || message.includes("não configurad")) return "config";
+  if (message.includes("invalid_grant") || message.includes("gmail api 401") || message.includes("token criptografado") || message.includes("authenticate data") || message.includes("decrypt")) return "reconnect";
+  if (message.includes("pub/sub") || message.includes("tópico") || message.includes("topic")) return "notifications";
+  if (message.includes("gmail api 403")) return "permissions";
+  return "sync";
+}
+
+async function renewGmailWatchSafely(connection: GmailConnection) {
+  try {
+    await renewGmailWatch(connection);
+    return null;
+  } catch (error) {
+    console.error("Sincronização concluída, mas a renovação das notificações do Gmail falhou.", error);
+    return gmailErrorReason(error);
+  }
 }
 
 function splitConfig(formData: FormData): SplitConfig[] {
@@ -658,38 +677,64 @@ export async function connectGmail() {
 
 export async function syncGmailNow() {
   const { userId } = await getContext();
-  const admin = createAdminClient();
-  const { data, error } = await admin.from("gmail_connections").select("*").eq("user_id", userId).single();
-  check(error, "Gmail ainda não conectado");
-  await renewGmailWatch(data as GmailConnection);
-  await syncGmailConnection(data as GmailConnection);
+  let failure: string | null = null;
+  let watchWarning: string | null = null;
+
+  try {
+    const admin = createAdminClient();
+    const { data, error } = await admin.from("gmail_connections").select("*").eq("user_id", userId).single();
+    check(error, "Gmail ainda não conectado");
+    const connection = data as GmailConnection;
+    await syncGmailConnection(connection);
+    watchWarning = await renewGmailWatchSafely(connection);
+  } catch (error) {
+    console.error("Falha na sincronização manual do Gmail.", error);
+    failure = gmailErrorReason(error);
+  }
+
+  if (failure) redirect(`/perfil?gmail=error&reason=${failure}`);
   revalidatePath("/perfil");
   revalidatePath("/extrato");
   revalidatePath("/dashboard");
-  redirect("/perfil?gmail=synced");
+  redirect(`/perfil?gmail=synced${watchWarning ? `&warning=${watchWarning}` : ""}`);
 }
 
 export async function reprocessGmailNow() {
   const { userId } = await getContext();
-  const admin = createAdminClient();
-  const [{ data: connection, error }, { data: imports }] = await Promise.all([
-    admin.from("gmail_connections").select("*").eq("user_id", userId).single(),
-    admin.from("email_imports").select("transaction_id").eq("user_id", userId),
-  ]);
-  check(error, "Gmail ainda não conectado");
-  const transactionIds = (imports ?? []).map((item) => item.transaction_id).filter(Boolean) as string[];
-  if (transactionIds.length) {
-    const { error: deleteTransactionsError } = await admin.from("transactions").delete().in("id", transactionIds);
-    check(deleteTransactionsError, "Não foi possível remover os lançamentos antigos");
+  let failure: string | null = null;
+  let watchWarning: string | null = null;
+
+  try {
+    const admin = createAdminClient();
+    const [{ data: connectionData, error }, { data: imports }] = await Promise.all([
+      admin.from("gmail_connections").select("*").eq("user_id", userId).single(),
+      admin.from("email_imports").select("transaction_id").eq("user_id", userId),
+    ]);
+    check(error, "Gmail ainda não conectado");
+    const connection = connectionData as GmailConnection;
+
+    // Valida credenciais e acesso antes de remover qualquer lançamento existente.
+    await validateGmailConnection(connection);
+
+    const transactionIds = (imports ?? []).map((item) => item.transaction_id).filter(Boolean) as string[];
+    if (transactionIds.length) {
+      const { error: deleteTransactionsError } = await admin.from("transactions").delete().in("id", transactionIds);
+      check(deleteTransactionsError, "Não foi possível remover os lançamentos antigos");
+    }
+    const { error: deleteImportsError } = await admin.from("email_imports").delete().eq("user_id", userId);
+    check(deleteImportsError, "Não foi possível preparar a releitura dos e-mails");
+    await syncGmailConnection(connection);
+    watchWarning = await renewGmailWatchSafely(connection);
+  } catch (error) {
+    console.error("Falha na releitura dos e-mails do Gmail.", error);
+    failure = gmailErrorReason(error);
   }
-  const { error: deleteImportsError } = await admin.from("email_imports").delete().eq("user_id", userId);
-  check(deleteImportsError, "Não foi possível preparar a releitura dos e-mails");
-  await renewGmailWatch(connection as GmailConnection);
-  await syncGmailConnection(connection as GmailConnection);
+
+  if (failure) redirect(`/perfil?gmail=error&reason=${failure}`);
   revalidatePath("/perfil");
   revalidatePath("/extrato");
   revalidatePath("/dashboard");
-  redirect("/perfil?gmail=reprocessed");
+  redirect(`/perfil?gmail=reprocessed${watchWarning ? `&warning=${watchWarning}` : ""}`);
 }
 
 export async function createFinancialSpace(formData: FormData) {
