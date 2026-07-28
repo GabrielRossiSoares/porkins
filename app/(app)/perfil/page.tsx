@@ -315,4 +315,3 @@ async function loadGmailConnection(userId: string): Promise<GmailConnectionSumma
 function FieldPct({ name, label, value }: { name: string; label: string; value: number }) {
   return <label className="flex items-center justify-between gap-2 text-sm"><span>{label}</span><span className="flex items-center gap-1"><input name={name} type="number" min="0" max="100" defaultValue={value} className="input !w-20 text-right" inputMode="numeric" /><span className="text-muted">%</span></span></label>;
 }
-
