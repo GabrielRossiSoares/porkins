@@ -24,6 +24,12 @@ type Account = { id: string; profile_id: string; name: string; kind: string; ins
 type Route = { id: string; profile_id: string; account_id: string | null; match_label: string; is_default: boolean };
 type DirectoryMember = { user_id: string; email: string; display_name: string; role: string };
 type PendingInvitation = { id: string; email: string; created_at: string };
+type GmailConnectionSummary = {
+  gmail_email: string;
+  last_synced_at: string | null;
+  last_error: string | null;
+  watch_expiration: string | null;
+};
 
 const TYPES = [
   { key: "razoavel", label: "Razoável", desc: "60 / 30 / 10 — equilíbrio", emoji: "🙂" },
@@ -44,12 +50,11 @@ export default async function Perfil({
   if (!active) return <p className="text-muted">Nenhum perfil.</p>;
   const params = await searchParams;
   const section = params.secao ?? "conta";
-  const admin = createAdminClient();
   const profileIds = profiles.map((profile) => profile.id);
   const [rulesResult, identityResult, gmailResult, accountsResult, membersResult, routesResult, directoryResult, invitationsResult] = await Promise.all([
     supabase.from("allocation_rules").select("bucket,percentage").eq("profile_id", active.id),
     supabase.auth.getUserIdentities(),
-    admin.from("gmail_connections").select("gmail_email,last_synced_at,last_error,watch_expiration").eq("user_id", userId).maybeSingle(),
+    loadGmailConnection(userId),
     profileIds.length
       ? supabase.from("accounts").select("id,profile_id,name,kind,institution,ownership").in("profile_id", profileIds).eq("active", true).order("name")
       : Promise.resolve({ data: [] }),
@@ -66,7 +71,7 @@ export default async function Perfil({
   const members = membersResult.data ?? [];
   const directory = (directoryResult.data ?? []) as DirectoryMember[];
   const pendingInvitations = (invitationsResult.data ?? []) as PendingInvitation[];
-  const gmail = gmailResult.data;
+  const gmail = gmailResult;
   const googleIdentity = identityResult.data?.identities.find((identity) => identity.provider === "google");
   const googleEmail = String(googleIdentity?.identity_data?.email ?? gmail?.gmail_email ?? "");
   const pctOf = (bucket: string) => Math.round(Number(rules.find((rule) => rule.bucket === bucket)?.percentage ?? 0) * 100);
@@ -286,6 +291,28 @@ function Status({ params }: { params: Record<string, string | undefined> }) {
   return message ? <div className="status-success" role="status">{message}</div> : null;
 }
 
+async function loadGmailConnection(userId: string): Promise<GmailConnectionSummary | null> {
+  try {
+    const admin = createAdminClient();
+    const { data, error } = await admin
+      .from("gmail_connections")
+      .select("gmail_email,last_synced_at,last_error,watch_expiration")
+      .eq("user_id", userId)
+      .maybeSingle();
+
+    if (error) {
+      console.error("Não foi possível carregar o estado da integração Gmail no Perfil.", error);
+      return null;
+    }
+
+    return data as GmailConnectionSummary | null;
+  } catch (error) {
+    console.error("Integração Gmail indisponível durante a abertura do Perfil.", error);
+    return null;
+  }
+}
+
 function FieldPct({ name, label, value }: { name: string; label: string; value: number }) {
   return <label className="flex items-center justify-between gap-2 text-sm"><span>{label}</span><span className="flex items-center gap-1"><input name={name} type="number" min="0" max="100" defaultValue={value} className="input !w-20 text-right" inputMode="numeric" /><span className="text-muted">%</span></span></label>;
 }
+
