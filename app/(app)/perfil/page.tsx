@@ -74,6 +74,7 @@ export default async function Perfil({
   const gmail = gmailResult;
   const googleIdentity = identityResult.data?.identities.find((identity) => identity.provider === "google");
   const googleEmail = String(googleIdentity?.identity_data?.email ?? gmail?.gmail_email ?? "");
+  const gmailReady = Boolean(gmail?.gmail_email);
   const pctOf = (bucket: string) => Math.round(Number(rules.find((rule) => rule.bucket === bucket)?.percentage ?? 0) * 100);
   const isShared = active.context_type !== "personal";
   const isBusiness = active.context_type === "business";
@@ -99,13 +100,17 @@ export default async function Perfil({
             <div>
               <p className="font-semibold">Gmail e lançamentos automáticos</p>
               <p className="text-xs text-muted mt-1">
-                {googleIdentity ? `Conectado a ${googleEmail}.` : "Conecte o Gmail que recebe notificações bancárias."}
+                {gmailReady
+                  ? `Conectado a ${googleEmail}.`
+                  : googleIdentity
+                    ? "Conta Google vinculada, mas o acesso ao Gmail precisa ser reconectado."
+                    : "Conecte o Gmail que recebe notificações bancárias."}
                 {gmail?.last_synced_at ? ` Última leitura: ${new Date(gmail.last_synced_at).toLocaleString("pt-BR")}.` : ""}
               </p>
               {gmail?.last_error && <p className="status-danger mt-2" role="alert">Falha recente: {gmail.last_error}</p>}
             </div>
-            {!googleIdentity ? (
-              <form action={connectGmail}><button className="btn w-full">Conectar Gmail</button></form>
+            {!gmailReady ? (
+              <form action={connectGmail}><button className="btn w-full">{googleIdentity ? "Reconectar Gmail" : "Conectar Gmail"}</button></form>
             ) : (
               <div className="grid grid-cols-2 gap-2">
                 <form action={syncGmailNow}><button className="btn w-full">Sincronizar agora</button></form>
@@ -277,6 +282,15 @@ function Tab({ href, active, label }: { href: string; active: boolean; label: st
 }
 
 function Status({ params }: { params: Record<string, string | undefined> }) {
+  const gmailErrors: Record<string, string> = {
+    config: "A configuração do Gmail está incompleta no servidor. Tente novamente após a atualização do serviço.",
+    reconnect: "A autorização do Gmail expirou ou não pôde ser lida. Reconecte sua conta Google.",
+    permissions: "O Gmail não autorizou a leitura das mensagens. Reconecte a conta e aceite a permissão solicitada.",
+    sync: "Não foi possível sincronizar o Gmail agora. Nenhum lançamento manual foi alterado.",
+  };
+  const errorMessage = params.gmail === "error"
+    ? gmailErrors[params.reason ?? "sync"] ?? gmailErrors.sync
+    : null;
   const message = params.gmail === "connected" ? "Gmail conectado com sucesso."
     : params.gmail === "synced" ? "Gmail sincronizado."
     : params.gmail === "reprocessed" ? "E-mails relidos e lançamentos atualizados."
@@ -288,7 +302,17 @@ function Status({ params }: { params: Record<string, string | undefined> }) {
     : params.rota === "saved" ? "Regra de importação salva."
     : params.senha === "ok" ? "Senha alterada."
     : null;
-  return message ? <div className="status-success" role="status">{message}</div> : null;
+  const warningMessage = params.warning === "notifications"
+    ? "Os e-mails foram sincronizados, mas as notificações automáticas ainda precisam ser reativadas."
+    : null;
+
+  return (
+    <>
+      {errorMessage && <div className="status-danger" role="alert">{errorMessage}</div>}
+      {message && <div className="status-success" role="status">{message}</div>}
+      {warningMessage && <div className="status-warning" role="status">{warningMessage}</div>}
+    </>
+  );
 }
 
 async function loadGmailConnection(userId: string): Promise<GmailConnectionSummary | null> {
