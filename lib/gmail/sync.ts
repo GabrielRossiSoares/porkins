@@ -185,6 +185,11 @@ async function importMessage(connection: GmailConnection, accessToken: string, m
   }
 }
 
+export async function validateGmailConnection(connection: GmailConnection) {
+  const accessToken = await getAccessToken(decryptToken(connection.encrypted_refresh_token));
+  await gmailFetch<{ messages?: { id: string }[] }>(accessToken, "/messages?maxResults=1");
+}
+
 export async function syncGmailConnection(connection: GmailConnection) {
   const admin = createAdminClient();
   try {
