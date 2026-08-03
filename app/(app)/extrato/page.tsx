@@ -2,6 +2,7 @@ import Link from "next/link";
 import { getContext } from "@/lib/profiles";
 import { brl } from "@/lib/format";
 import { updateTransaction, deleteTransaction, markTransactionSplitPaid } from "../actions";
+import { SubmitButton } from "../SubmitButton";
 
 export const dynamic = "force-dynamic";
 
@@ -50,7 +51,7 @@ export default async function Extrato({
   let query = supabase
     .from("transactions")
     .select("id,amount,description,occurred_at,category_id,needs_review,transaction_type,counterparty,account_label,paid_by_user_id,destination_profile_id,installment_number,installment_count,categoria:categories(name),conta:accounts(name),divisoes:transaction_splits(id,debtor_user_id,amount,status)")
-    .or(`profile_id.eq.${active.id},destination_profile_id.eq.${active.id}`)
+    .eq("profile_id", active.id)
     .order("occurred_at", { ascending: false })
     .order("created_at", { ascending: false });
 
@@ -180,6 +181,15 @@ export default async function Extrato({
                     <input name="amount" aria-label="Valor do lançamento" type="text" inputMode="decimal" defaultValue={Number(transaction.amount)} className="input" placeholder="Valor" />
                     <input name="occurred_at" aria-label="Data do lançamento" type="date" defaultValue={transaction.occurred_at} className="input" />
                   </div>
+                  {transaction.installment_count > 1 && (
+                    <label className="label">Aplicar alteração
+                      <select name="edit_scope" className="input mt-1" defaultValue="current">
+                        <option value="current">Somente esta parcela</option>
+                        <option value="future">Esta e as próximas</option>
+                        <option value="all">Todas as parcelas da compra</option>
+                      </select>
+                    </label>
+                  )}
                   <input name="description" aria-label="Descrição do lançamento" type="text" defaultValue={transaction.description ?? ""} className="input" placeholder="Descrição" />
                   <select name="category_id" aria-label="Categoria do lançamento" defaultValue={transaction.category_id ?? ""} className="input">
                     <option value="">Sem categoria</option>
@@ -195,7 +205,7 @@ export default async function Extrato({
                       <input name="split_amount" aria-label="Valor devido pela outra pessoa" type="text" inputMode="decimal" defaultValue={split ? Number(split.amount) : ""} className="input" placeholder="Parte da pessoa" />
                     </div>
                   )}
-                  <button className="btn">Salvar alterações</button>
+                  <SubmitButton pendingLabel="Salvando alterações...">Salvar alterações</SubmitButton>
                 </form>
                 {split && !transaction.destination_profile_id && (
                   <form action={markTransactionSplitPaid} className="mt-2">
@@ -208,7 +218,7 @@ export default async function Extrato({
                 )}
                 <form action={deleteTransaction} className="mt-2">
                   <input type="hidden" name="id" value={transaction.id} />
-                  <button className="btn-danger w-full">Excluir lançamento</button>
+                  <SubmitButton className="btn-danger w-full" pendingLabel="Excluindo..." confirmMessage="Excluir este lançamento? Esta ação não pode ser desfeita.">Excluir lançamento</SubmitButton>
                 </form>
               </details>
             );

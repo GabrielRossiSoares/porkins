@@ -26,6 +26,8 @@ type Account = {
   email_aliases: string[] | null;
 };
 type Category = { id: string; name: string; is_income: boolean; profile_id?: string | null };
+type ImportOptions = { replaceExisting?: boolean };
+type GmailMessageList = { messages?: { id: string }[]; nextPageToken?: string };
 
 const key = (value: string | null | undefined) =>
   (value ?? "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().trim();
@@ -102,31 +104,53 @@ function chooseAccount(accounts: Account[], route: ReturnType<typeof chooseRoute
   ) ?? null;
 }
 
-async function importMessage(connection: GmailConnection, accessToken: string, messageId: string) {
+async function importMessage(
+  connection: GmailConnection,
+  accessToken: string,
+  messageId: string,
+  options: ImportOptions = {},
+) {
   const admin = createAdminClient();
   const message = await gmailFetch<GmailMessage>(accessToken, `/messages/${messageId}?format=full`);
   const subject = header(message, "subject").slice(0, 240);
   const receivedAt = message.internalDate ? new Date(Number(message.internalDate)).toISOString() : new Date().toISOString();
+  const { data: existingImport, error: existingImportError } = options.replaceExisting
+    ? await admin.from("email_imports").select("id,transaction_id,status").eq("gmail_message_id", message.id).maybeSingle()
+    : { data: null, error: null };
+  if (existingImportError) throw existingImportError;
+  let importId = existingImport?.id as string | undefined;
+  const previousTransactionId = existingImport?.transaction_id as string | null | undefined;
 
-  const { error: claimError } = await admin.from("email_imports").insert({
-    user_id: connection.user_id,
-    profile_id: connection.profile_id,
-    gmail_message_id: message.id,
-    subject,
-    received_at: receivedAt,
-    parser_version: 2,
-  });
-  if (claimError?.code === "23505") return "duplicate";
-  if (claimError) throw claimError;
+  if (!importId) {
+    const { data: claimedImport, error: claimError } = await admin.from("email_imports").insert({
+      user_id: connection.user_id,
+      profile_id: connection.profile_id,
+      gmail_message_id: message.id,
+      subject,
+      received_at: receivedAt,
+      parser_version: 2,
+    }).select("id").single();
+    if (claimError?.code === "23505") return "duplicate";
+    if (claimError) throw claimError;
+    importId = claimedImport.id;
+  }
 
   try {
     if (!trustedNubank(message)) {
-      await admin.from("email_imports").update({ status: "ignored", error: "Remetente não autenticado como Nubank" }).eq("gmail_message_id", message.id);
+      if (previousTransactionId) return "preserved";
+      await admin.from("email_imports").update({
+        subject, received_at: receivedAt, status: "ignored",
+        error: "Remetente não autenticado como Nubank",
+      }).eq("id", importId);
       return "ignored";
     }
     const parsed = parseNubankTransaction(subject, textFromPart(message.payload), receivedAt);
     if (!parsed) {
-      await admin.from("email_imports").update({ status: "ignored", error: "Não é uma notificação de transação reconhecida" }).eq("gmail_message_id", message.id);
+      if (previousTransactionId) return "preserved";
+      await admin.from("email_imports").update({
+        subject, received_at: receivedAt, status: "ignored",
+        error: "Não é uma notificação de transação reconhecida",
+      }).eq("id", importId);
       return "ignored";
     }
 
@@ -151,8 +175,7 @@ async function importMessage(connection: GmailConnection, accessToken: string, m
       if (!categoryId) categoryId = await classifyCategory(parsed.description, subject, allCategories.filter((category) => !category.is_income));
     }
     const needsReview = parsed.needsReview || (parsed.transactionType === "expense" && !categoryId);
-
-    const { data: transaction, error: transactionError } = await admin.from("transactions").insert({
+    const transactionPayload = {
       profile_id: route.profile_id,
       account_id: account?.id ?? null,
       category_id: categoryId,
@@ -167,36 +190,66 @@ async function importMessage(connection: GmailConnection, accessToken: string, m
       source: "email",
       needs_review: needsReview,
       raw_text: `gmail:${message.id} | ${subject}`,
-    }).select("id").single();
-    if (transactionError) throw transactionError;
-    await admin.from("email_imports").update({
+    };
+
+    let transactionId = previousTransactionId;
+    if (transactionId) {
+      const { error: transactionError } = await admin.from("transactions").update(transactionPayload).eq("id", transactionId);
+      if (transactionError) throw transactionError;
+    } else {
+      const { data: transaction, error: transactionError } = await admin.from("transactions")
+        .insert(transactionPayload).select("id").single();
+      if (transactionError) throw transactionError;
+      transactionId = transaction.id;
+    }
+
+    const { error: importUpdateError } = await admin.from("email_imports").update({
       profile_id: route.profile_id,
       route_id: route.id,
+      subject,
+      received_at: receivedAt,
       status: "imported",
-      transaction_id: transaction.id,
+      transaction_id: transactionId,
       parser_version: 2,
       parsed_payload: parsed,
       error: null,
-    }).eq("gmail_message_id", message.id);
-    return "imported";
+    }).eq("id", importId);
+    if (importUpdateError) throw importUpdateError;
+    return previousTransactionId ? "updated" : "imported";
   } catch (error) {
-    await admin.from("email_imports").update({ status: "error", error: error instanceof Error ? error.message.slice(0, 500) : "Erro desconhecido" }).eq("gmail_message_id", message.id);
+    await admin.from("email_imports").update({
+      error: error instanceof Error ? error.message.slice(0, 500) : "Erro desconhecido",
+    }).eq("id", importId);
     throw error;
   }
 }
 
+async function listGmailMessageIds(accessToken: string, query: string) {
+  const ids: string[] = [];
+  let pageToken: string | undefined;
+  do {
+    const params = new URLSearchParams({ maxResults: "100", q: query });
+    if (pageToken) params.set("pageToken", pageToken);
+    const page = await gmailFetch<GmailMessageList>(accessToken, `/messages?${params}`);
+    ids.push(...(page.messages ?? []).map((message) => message.id));
+    pageToken = page.nextPageToken;
+  } while (pageToken && ids.length < 5000);
+  return ids;
+}
 export async function validateGmailConnection(connection: GmailConnection) {
   const accessToken = await getAccessToken(decryptToken(connection.encrypted_refresh_token));
   await gmailFetch<{ messages?: { id: string }[] }>(accessToken, "/messages?maxResults=1");
 }
 
-export async function syncGmailConnection(connection: GmailConnection) {
+export async function syncGmailConnection(connection: GmailConnection, options: ImportOptions = {}) {
   const admin = createAdminClient();
   try {
     const accessToken = await getAccessToken(decryptToken(connection.encrypted_refresh_token));
-    const list = await gmailFetch<{ messages?: { id: string }[] }>(accessToken, "/messages?maxResults=100&q=from%3A%28nubank.com.br%29+newer_than%3A14d");
+    const messageIds = await listGmailMessageIds(accessToken, "from:(nubank.com.br) newer_than:14d");
     const results = [];
-    for (const message of list.messages ?? []) results.push(await importMessage(connection, accessToken, message.id));
+    for (const messageId of messageIds) {
+      results.push(await importMessage(connection, accessToken, messageId, options));
+    }
     await admin.from("gmail_connections").update({ last_synced_at: new Date().toISOString(), last_error: null, updated_at: new Date().toISOString() }).eq("user_id", connection.user_id);
     return results;
   } catch (error) {

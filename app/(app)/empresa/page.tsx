@@ -2,7 +2,6 @@ import Link from "next/link";
 import { redirect } from "next/navigation";
 import { brl } from "@/lib/format";
 import { getContext } from "@/lib/profiles";
-import { markProfileTransactionsReviewed } from "../actions";
 import { EmpresaTabs } from "./EmpresaTabs";
 
 export const dynamic = "force-dynamic";
@@ -64,7 +63,7 @@ export default async function Empresa({ searchParams }: { searchParams: Promise<
       {overdue.length>0&&<ActionRow href="/empresa/clientes" tone="attention" title={`${overdue.length} recebimento(s) vencido(s)`} detail={brl(overdue.reduce((sum,item)=>sum+Number(item.amount),0))}/>}
       {unmatched.length>0&&<ActionRow href="/empresa/caixa" tone="attention" title={`${unmatched.length} entrada(s) para conciliar`} detail={`${brl(unmatched.reduce((sum,item)=>sum+Number(item.amount),0))} no extrato bancário`}/>}
       {partnerPending>0&&<ActionRow href="/empresa/socios" tone="neutral" title={`${brl(partnerPending)} para repassar`} detail="Distribuições e pagamentos aos sócios"/>}
-      {reviewCount>0&&<div className="action-row"><StatusDot tone="attention"/><Link href="/extrato?tipo=revisar" className="flex-1 min-w-0"><strong className="block text-sm">{reviewCount} movimento(s) para revisar</strong><span className="text-xs text-muted">{brl(reviewAmount)} aguardando confirmação</span></Link><form action={markProfileTransactionsReviewed}><input type="hidden" name="profile_id" value={active.id}/><input type="hidden" name="next" value="/empresa"/><button className="quiet-action">Confirmar</button></form></div>}
+      {reviewCount>0&&<div className="action-row"><StatusDot tone="attention"/><Link href="/extrato?tipo=revisar" className="flex-1 min-w-0"><strong className="block text-sm">{reviewCount} movimento(s) para revisar</strong><span className="text-xs text-muted">{brl(reviewAmount)} aguardando revisão individual</span></Link><Link href="/extrato?tipo=revisar" className="quiet-action">Revisar</Link></div>}
       {overdue.length===0&&unmatched.length===0&&partnerPending===0&&reviewCount===0&&<div className="empty-calm"><StatusDot tone="good"/><div><strong className="text-sm">Operação em ordem</strong><p className="text-xs text-muted">Nenhuma pendência financeira agora.</p></div></div>}
     </div></section>
 

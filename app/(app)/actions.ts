@@ -71,26 +71,45 @@ async function requireProfile(profileId: string): Promise<AppSupabase> {
   return supabase;
 }
 
+async function requireProfileRole(profileId: string, allowedRoles: string[]) {
+  const supabase = await requireProfile(profileId);
+  const { userId } = await getContext();
+  const { data, error } = await supabase.from("profile_members")
+    .select("role").eq("profile_id", profileId).eq("user_id", userId).single();
+  check(error, "Não foi possível validar sua permissão");
+  if (!data || !allowedRoles.includes(data.role)) fail("Você não tem permissão para realizar esta ação.");
+  return supabase;
+}
+
+const requireProfileEditor = (profileId: string) =>
+  requireProfileRole(profileId, ["owner", "admin", "member"]);
+
+const requireProfileAdmin = (profileId: string) =>
+  requireProfileRole(profileId, ["owner", "admin"]);
+
+const requireProfileOwner = (profileId: string) =>
+  requireProfileRole(profileId, ["owner"]);
 async function requireOwnedRow(
   table: "transactions" | "income_sources" | "goals" | "house_products" | "house_costs" | "accounts",
   id: string,
 ) {
-  const { supabase, profiles } = await getContext();
+  const { supabase } = await getContext();
   const { data, error } = await supabase.from(table).select("profile_id").eq("id", id).single();
   check(error, "Não foi possível validar o registro");
-  if (!data || !profiles.some((profile) => profile.id === data.profile_id)) fail("Acesso negado ao registro.");
-  return supabase;
+  if (!data) fail("Registro não encontrado.");
+  return requireProfileEditor(data.profile_id);
 }
-
 export async function switchProfile(formData: FormData) {
   const id = String(formData.get("profileId") ?? "");
-  const next = String(formData.get("next") ?? "/dashboard");
+  const requestedNext = String(formData.get("next") ?? "/dashboard");
+  const next = requestedNext.startsWith("/") && !requestedNext.startsWith("//") ? requestedNext : "/dashboard";
   await requireProfile(id);
   const cookieStore = await cookies();
-  cookieStore.set(ACTIVE_COOKIE, id, { path: "/", maxAge: 60 * 60 * 24 * 365 });
+  cookieStore.set(ACTIVE_COOKIE, id, {
+    path: "/", maxAge: 60 * 60 * 24 * 365, httpOnly: true, sameSite: "lax", secure: process.env.NODE_ENV === "production",
+  });
   redirect(next);
 }
-
 export async function logout() {
   const supabase = await createClient();
   await supabase.auth.signOut();
@@ -99,7 +118,7 @@ export async function logout() {
 
 export async function addTransaction(formData: FormData) {
   const profileId = String(formData.get("profile_id") ?? "");
-  const supabase = await requireProfile(profileId);
+  const supabase = await requireProfileEditor(profileId);
   const { userId, profiles } = await getContext();
   const totalAmount = parseBRL(formData.get("amount"));
   if (totalAmount <= 0) fail("Informe um valor maior que zero.");
@@ -198,72 +217,58 @@ export async function addTransaction(formData: FormData) {
 export async function updateTransaction(formData: FormData) {
   const id = String(formData.get("id") ?? "");
   if (!id) return;
-  const supabase = await requireOwnedRow("transactions", id);
-  const { userId } = await getContext();
-  const { data: ownedTransaction, error: ownedError } = await supabase
-    .from("transactions").select("profile_id,destination_profile_id,paid_by_user_id").eq("id", id).single();
-  check(ownedError, "Não foi possível validar o lançamento");
-  if (!ownedTransaction) fail("Lançamento não encontrado.");
-  const category_id = String(formData.get("category_id") ?? "") || null;
+  await requireOwnedRow("transactions", id);
+  const { supabase } = await getContext();
+  const categoryId = String(formData.get("category_id") ?? "") || null;
   const txnType = transactionType(formData.get("transaction_type"));
   const amount = parseBRL(formData.get("amount"));
+  const editScope = ["current", "future", "all"].includes(String(formData.get("edit_scope")))
+    ? String(formData.get("edit_scope"))
+    : "current";
+  const manageSplits = String(formData.get("manage_splits") ?? "") === "1";
+  const debtorUserId = manageSplits ? String(formData.get("debtor_user_id") ?? "") || null : null;
+  const splitAmount = debtorUserId ? parseBRL(formData.get("split_amount")) : null;
   if (amount <= 0) fail("Informe um valor maior que zero.");
-  const { error } = await supabase
-    .from("transactions")
-    .update({
-      amount,
-      description: String(formData.get("description") ?? "").trim() || null,
-      category_id,
-      transaction_type: txnType,
-      occurred_at: String(formData.get("occurred_at") ?? "") || undefined,
-      needs_review: txnType === "expense" && !category_id,
-    })
-    .eq("id", id);
-  check(error, "Não foi possível atualizar o lançamento");
-  if (String(formData.get("manage_splits") ?? "") === "1") {
-    const { error: clearSplitError } = await supabase.from("transaction_splits").delete().eq("transaction_id", id);
-    check(clearSplitError, "Não foi possível atualizar a divisão");
-    await saveTransactionSplit(
-      supabase, id, ownedTransaction.destination_profile_id ?? ownedTransaction.profile_id,
-      ownedTransaction.paid_by_user_id ?? userId, amount, formData,
-    );
+  if (splitAmount !== null && (splitAmount <= 0 || splitAmount > amount)) {
+    fail("A parte da pessoa deve ser maior que zero e não pode superar a parcela.");
   }
+
+  const { error } = await supabase.rpc("fn_update_transaction_series", {
+    p_transaction_id: id,
+    p_scope: editScope,
+    p_amount: amount,
+    p_description: String(formData.get("description") ?? "").trim(),
+    p_category_id: categoryId,
+    p_transaction_type: txnType,
+    p_occurred_at: String(formData.get("occurred_at") ?? "") || new Date().toISOString().slice(0, 10),
+    p_manage_split: manageSplits,
+    p_debtor_user_id: debtorUserId,
+    p_split_amount: splitAmount,
+  });
+  check(error, "Não foi possível atualizar o lançamento");
   revalidatePath("/extrato");
   revalidatePath("/dashboard");
   revalidatePath("/acertos");
 }
-
-async function saveTransactionSplit(
-  supabase: AppSupabase,
-  transactionId: string,
-  profileId: string,
-  payerUserId: string,
-  totalAmount: number,
-  formData: FormData,
-) {
-  const debtorUserId = String(formData.get("debtor_user_id") ?? "");
-  const splitAmount = parseBRL(formData.get("split_amount"));
-  if (!debtorUserId && splitAmount <= 0) return;
-  if (!debtorUserId || splitAmount <= 0) fail("Escolha a pessoa e informe quanto ela deve pagar.");
-  if (debtorUserId === payerUserId) fail("Escolha outro membro para dividir o gasto.");
-  if (splitAmount > totalAmount) fail("A parte da outra pessoa não pode ser maior que o total.");
-  const { data: member } = await supabase.from("profile_members")
-    .select("user_id").eq("profile_id", profileId).eq("user_id", debtorUserId).maybeSingle();
-  if (!member) fail("A pessoa escolhida não faz parte deste espaço.");
-  const { error } = await supabase.from("transaction_splits").insert({
-    transaction_id: transactionId,
-    profile_id: profileId,
-    debtor_user_id: debtorUserId,
-    amount: splitAmount,
-    status: "pending",
-  });
-  check(error, "Não foi possível dividir o lançamento");
-}
-
 export async function markTransactionSplitPaid(formData: FormData) {
   const id = String(formData.get("id") ?? "");
   const status = String(formData.get("status") ?? "paid") === "pending" ? "pending" : "paid";
-  const { supabase } = await getContext();
+  const { supabase, userId } = await getContext();
+  const { data: split, error: splitError } = await supabase.from("transaction_splits")
+    .select("profile_id,debtor_user_id,transaction_id").eq("id", id).single();
+  check(splitError, "Não foi possível validar o acerto");
+  if (!split) fail("Acerto não encontrado.");
+
+  const [{ data: membership }, { data: transaction }] = await Promise.all([
+    supabase.from("profile_members").select("role")
+      .eq("profile_id", split.profile_id).eq("user_id", userId).single(),
+    supabase.from("transactions").select("paid_by_user_id").eq("id", split.transaction_id).single(),
+  ]);
+  const canSettle = split.debtor_user_id === userId
+    || transaction?.paid_by_user_id === userId
+    || ["owner", "admin"].includes(membership?.role ?? "");
+  if (!canSettle) fail("Você não pode alterar o acerto de outra pessoa.");
+
   const { error } = await supabase.from("transaction_splits").update({
     status,
     settled_at: status === "paid" ? new Date().toISOString() : null,
@@ -273,7 +278,6 @@ export async function markTransactionSplitPaid(formData: FormData) {
   revalidatePath("/dashboard");
   revalidatePath("/acertos");
 }
-
 export async function deleteTransaction(formData: FormData) {
   const id = String(formData.get("id") ?? "");
   if (!id) return;
@@ -309,7 +313,7 @@ export async function updateIncome(formData: FormData) {
 
 export async function addIncome(formData: FormData) {
   const profile_id = String(formData.get("profile_id") ?? "");
-  const supabase = await requireProfile(profile_id);
+  const supabase = await requireProfileEditor(profile_id);
   const name = String(formData.get("name") ?? "").trim();
   const amount = parseBRL(formData.get("amount"));
   if (!profile_id || !name) return;
@@ -344,15 +348,12 @@ async function setBucket(
 ) {
   const { error } = await supabase
     .from("allocation_rules")
-    .update({ percentage: pct })
-    .eq("profile_id", profile_id)
-    .eq("bucket", bucket);
+    .upsert({ profile_id, bucket, label: bucket, percentage: pct }, { onConflict: "profile_id,bucket" });
   check(error, "Não foi possível atualizar a regra");
 }
-
 export async function setProfileType(formData: FormData) {
   const profile_id = String(formData.get("profile_id") ?? "");
-  const supabase = await requireProfile(profile_id);
+  const supabase = await requireProfileAdmin(profile_id);
   const requestedType = String(formData.get("type") ?? "razoavel");
   const type = requestedType in PROFILE_PRESETS ? requestedType : "razoavel";
   const preset = PROFILE_PRESETS[type];
@@ -369,11 +370,12 @@ export async function setProfileType(formData: FormData) {
 export async function updateAllocations(formData: FormData) {
   const profile_id = String(formData.get("profile_id") ?? "");
   if (!profile_id) return;
-  const supabase = await requireProfile(profile_id);
+  const supabase = await requireProfileAdmin(profile_id);
   const o = Number(formData.get("obrigatoria") ?? 0) / 100;
   const n = Number(formData.get("nao_obrig") ?? 0) / 100;
   const i = Number(formData.get("investimento") ?? 0) / 100;
   if ([o, n, i].some((value) => !Number.isFinite(value) || value < 0 || value > 1)) fail("Percentuais inválidos.");
+  if (Math.abs(o + n + i - 1) > 0.0001) fail("Os percentuais do planejamento precisam somar 100%.");
   const { error } = await supabase.from("profiles").update({ profile_type: "personalizado" }).eq("id", profile_id);
   check(error, "Não foi possível atualizar o perfil");
   await setBucket(supabase, profile_id, "obrigatoria", o);
@@ -404,7 +406,7 @@ export async function toggleBillPaid(formData: FormData) {
   const isPaid = String(formData.get("is_paid") ?? "") === "1";
   if (!cost_id || !ym) return;
   const supabase = await requireOwnedRow("house_costs", cost_id);
-  await requireProfile(profile_id);
+  await requireProfileEditor(profile_id);
   const { data: cost, error: costError } = await supabase.from("house_costs").select("profile_id").eq("id", cost_id).single();
   check(costError, "Não foi possível validar a conta");
   if (cost?.profile_id !== profile_id) fail("A conta não pertence ao perfil informado.");
@@ -427,7 +429,7 @@ export async function toggleBillPaid(formData: FormData) {
 
 export async function importTransactionsCsv(formData: FormData) {
   const profileId = String(formData.get("profile_id") ?? "");
-  const supabase = await requireProfile(profileId);
+  const supabase = await requireProfileEditor(profileId);
   const selected = formData.getAll("files").filter((item): item is File => item instanceof File && item.size > 0);
   const fallback = formData.get("file");
   const files = selected.length > 0 ? selected : fallback instanceof File && fallback.size > 0 ? [fallback] : [];
@@ -531,7 +533,7 @@ export async function updateAccountFinancialSettings(formData: FormData) {
 
 export async function addGoal(formData: FormData) {
   const profileId = String(formData.get("profile_id") ?? "");
-  const supabase = await requireProfile(profileId);
+  const supabase = await requireProfileEditor(profileId);
   const name = String(formData.get("name") ?? "").trim();
   const targetAmount = parseBRL(formData.get("target_amount"));
   if (!name || targetAmount <= 0) fail("Informe o nome e uma meta maior que zero.");
@@ -585,7 +587,7 @@ export async function deleteGoal(formData: FormData) {
 
 export async function addHouseProduct(formData: FormData) {
   const profileId = String(formData.get("profile_id") ?? "");
-  const supabase = await requireProfile(profileId);
+  const supabase = await requireProfileEditor(profileId);
   const name = String(formData.get("name") ?? "").trim();
   if (!name) fail("Informe o nome do produto.");
   const { error } = await supabase.from("house_products").insert({
@@ -613,26 +615,31 @@ export async function deleteHouseProduct(formData: FormData) {
 
 export async function addHouseCost(formData: FormData) {
   const profileId = String(formData.get("profile_id") ?? "");
-  const supabase = await requireProfile(profileId);
+  const supabase = await requireProfileEditor(profileId);
   const name = String(formData.get("name") ?? "").trim();
   const expectedValue = parseBRL(formData.get("expected_value"));
-  if (!name || expectedValue <= 0) fail("Informe o nome e um valor maior que zero.");
-  const barbaraPct = Number(formData.get("barbara_pct") ?? 63.41) / 100;
-  if (!Number.isFinite(barbaraPct) || barbaraPct < 0 || barbaraPct > 1) fail("Rateio inválido.");
-  const { error } = await supabase.from("house_costs").insert({
-    profile_id: profileId,
-    name,
-    cost_type: String(formData.get("cost_type") ?? "recorrente"),
-    expected_value: expectedValue,
-    barbara_pct: barbaraPct,
-    gabriel_pct: 1 - barbaraPct,
-    buy_when: String(formData.get("buy_when") ?? "").trim() || null,
+  const userIds = formData.getAll("member_user_id").map(String).filter(Boolean);
+  const percentages = userIds.map((id) => Number(formData.get(`percentage_${id}`) ?? 0) / 100);
+  if (!name || expectedValue <= 0) fail("Preencha o custo e um valor maior que zero.");
+  if (!userIds.length || percentages.some((value) => !Number.isFinite(value) || value < 0 || value > 1)) {
+    fail("Informe uma divisão válida.");
+  }
+  if (Math.abs(percentages.reduce((sum, value) => sum + value, 0) - 1) > 0.0001) {
+    fail("A divisão do custo precisa somar 100%.");
+  }
+  const { error } = await supabase.rpc("fn_create_house_cost", {
+    p_profile_id: profileId,
+    p_cost_type: String(formData.get("cost_type") ?? "recorrente"),
+    p_name: name,
+    p_expected_value: expectedValue,
+    p_buy_when: String(formData.get("buy_when") ?? "").trim() || null,
+    p_user_ids: userIds,
+    p_percentages: percentages,
   });
   check(error, "Não foi possível adicionar o custo");
   revalidatePath("/casa/contas");
   revalidatePath("/dashboard");
 }
-
 export async function deleteHouseCost(formData: FormData) {
   const id = String(formData.get("id") ?? "");
   const supabase = await requireOwnedRow("house_costs", id);
@@ -706,24 +713,15 @@ export async function reprocessGmailNow() {
 
   try {
     const admin = createAdminClient();
-    const [{ data: connectionData, error }, { data: imports }] = await Promise.all([
-      admin.from("gmail_connections").select("*").eq("user_id", userId).single(),
-      admin.from("email_imports").select("transaction_id").eq("user_id", userId),
-    ]);
+    const { data: connectionData, error } = await admin
+      .from("gmail_connections").select("*").eq("user_id", userId).single();
     check(error, "Gmail ainda não conectado");
     const connection = connectionData as GmailConnection;
 
-    // Valida credenciais e acesso antes de remover qualquer lançamento existente.
+    // Atualiza cada lançamento existente individualmente. Se a releitura falhar,
+    // a versão anterior permanece associada ao e-mail e não é apagada.
     await validateGmailConnection(connection);
-
-    const transactionIds = (imports ?? []).map((item) => item.transaction_id).filter(Boolean) as string[];
-    if (transactionIds.length) {
-      const { error: deleteTransactionsError } = await admin.from("transactions").delete().in("id", transactionIds);
-      check(deleteTransactionsError, "Não foi possível remover os lançamentos antigos");
-    }
-    const { error: deleteImportsError } = await admin.from("email_imports").delete().eq("user_id", userId);
-    check(deleteImportsError, "Não foi possível preparar a releitura dos e-mails");
-    await syncGmailConnection(connection);
+    await syncGmailConnection(connection, { replaceExisting: true });
     watchWarning = await renewGmailWatchSafely(connection);
   } catch (error) {
     console.error("Falha na releitura dos e-mails do Gmail.", error);
@@ -736,7 +734,6 @@ export async function reprocessGmailNow() {
   revalidatePath("/dashboard");
   redirect(`/perfil?gmail=reprocessed${watchWarning ? `&warning=${watchWarning}` : ""}`);
 }
-
 export async function createFinancialSpace(formData: FormData) {
   const { supabase } = await getContext();
   const name = String(formData.get("name") ?? "").trim();
@@ -759,7 +756,7 @@ export async function createFinancialSpace(formData: FormData) {
 export async function inviteProfileMember(formData: FormData) {
   const profileId = String(formData.get("profile_id") ?? "");
   const email = String(formData.get("email") ?? "").trim().toLowerCase();
-  const supabase = await requireProfile(profileId);
+  const supabase = await requireProfileOwner(profileId);
   if (!email) fail("Informe o e-mail do novo membro.");
   const { data, error } = await supabase.rpc("fn_invite_profile_member", {
     p_profile_id: profileId,
@@ -786,7 +783,7 @@ export async function respondProfileInvitation(formData: FormData) {
 
 export async function addFinancialAccount(formData: FormData) {
   const profileId = String(formData.get("profile_id") ?? "");
-  const supabase = await requireProfile(profileId);
+  const supabase = await requireProfileEditor(profileId);
   const name = String(formData.get("name") ?? "").trim();
   if (!name) fail("Informe o nome da conta.");
   const aliases = String(formData.get("email_aliases") ?? "")
@@ -807,7 +804,7 @@ export async function addFinancialAccount(formData: FormData) {
 export async function saveGmailRoute(formData: FormData) {
   const profileId = String(formData.get("profile_id") ?? "");
   const { userId } = await getContext();
-  const supabase = await requireProfile(profileId);
+  const supabase = await requireProfileEditor(profileId);
   const isDefault = String(formData.get("is_default") ?? "") === "1";
   const matchLabel = isDefault ? "*" : String(formData.get("match_label") ?? "").trim();
   if (!matchLabel) fail("Informe como a conta aparece no e-mail.");
@@ -839,7 +836,7 @@ export async function deleteGmailRoute(formData: FormData) {
 }
 
 async function requireBusinessProfile(profileId: string): Promise<AppSupabase> {
-  const supabase = await requireProfile(profileId);
+  const supabase = await requireProfileAdmin(profileId);
   const { profiles } = await getContext();
   if (profiles.find((profile) => profile.id === profileId)?.context_type !== "business") fail("Este recurso é exclusivo de espaços empresariais.");
   return supabase;
@@ -948,21 +945,18 @@ export async function markBusinessPayablePaid(formData: FormData) {
   check(error, "Não foi possível confirmar o repasse");
   revalidatePath("/empresa"); revalidatePath("/empresa/socios");
 }
-export async function markProfileTransactionsReviewed(formData: FormData) {
-  const profileId = String(formData.get("profile_id") ?? "");
+export async function setQuickHideValues(profileId: string, hidden: boolean) {
   const supabase = await requireProfile(profileId);
-  const { error } = await supabase.from("transactions")
-    .update({ needs_review: false })
-    .eq("profile_id", profileId)
-    .eq("needs_review", true)
-    .eq("status", "confirmed");
-  check(error, "Não foi possível confirmar os lançamentos");
-  revalidatePath("/dashboard");
-  revalidatePath("/extrato");
-  const next = formData.get("next") === "/empresa" ? "/empresa" : "/dashboard";
-  redirect(`${next}?revisao=ok`);
+  const { userId } = await getContext();
+  const { error } = await supabase.from("profile_user_settings").upsert({
+    profile_id: profileId,
+    user_id: userId,
+    hide_values: Boolean(hidden),
+    updated_at: new Date().toISOString(),
+  }, { onConflict: "profile_id,user_id" });
+  check(error, "Não foi possível salvar a privacidade dos valores");
+  revalidatePath("/", "layout");
 }
-
 export async function saveProfileUserSettings(formData: FormData) {
   const profileId = String(formData.get("profile_id") ?? "");
   const supabase = await requireProfile(profileId);
@@ -983,7 +977,7 @@ export async function saveProfileUserSettings(formData: FormData) {
 
 export async function addCustomCategory(formData: FormData) {
   const profileId = String(formData.get("profile_id") ?? "");
-  const supabase = await requireProfile(profileId);
+  const supabase = await requireProfileEditor(profileId);
   const { userId } = await getContext();
   const name = String(formData.get("name") ?? "").trim();
   if (!name) fail("Informe o nome da categoria.");
@@ -998,7 +992,7 @@ export async function addCustomCategory(formData: FormData) {
 
 export async function archiveCustomCategory(formData: FormData) {
   const profileId = String(formData.get("profile_id") ?? "");
-  const supabase = await requireProfile(profileId);
+  const supabase = await requireProfileEditor(profileId);
   const { error } = await supabase.from("categories").update({ archived: true })
     .eq("id", String(formData.get("id") ?? "")).eq("profile_id", profileId);
   check(error, "Nao foi possivel arquivar a categoria");
@@ -1009,16 +1003,17 @@ export async function createProfileTransfer(formData: FormData) {
   const sourceId = String(formData.get("source_profile_id") ?? "");
   const destinationId = String(formData.get("destination_profile_id") ?? "");
   if (!sourceId || !destinationId || sourceId === destinationId) fail("Escolha dois espacos diferentes.");
-  const supabase = await requireProfile(sourceId);
-  await requireProfile(destinationId);
+  const supabase = await requireProfileEditor(sourceId);
+  await requireProfileEditor(destinationId);
+  const { userId } = await getContext();
   const amount = parseBRL(formData.get("amount"));
   if (amount <= 0) fail("Informe um valor maior que zero.");
   const occurredAt = String(formData.get("occurred_at") ?? "") || new Date().toISOString().slice(0, 10);
   const description = String(formData.get("description") ?? "Transferencia entre espacos").trim();
   const transferGroupId = crypto.randomUUID();
   const { error } = await supabase.from("transactions").insert([
-    { profile_id: sourceId, destination_profile_id: destinationId, amount, description, occurred_at: occurredAt, transaction_type: "transfer_out", source: "manual", transfer_group_id: transferGroupId },
-    { profile_id: destinationId, destination_profile_id: sourceId, amount, description, occurred_at: occurredAt, transaction_type: "transfer_in", source: "manual", transfer_group_id: transferGroupId },
+    { profile_id: sourceId, amount, description, occurred_at: occurredAt, transaction_type: "transfer_out", source: "manual", transfer_group_id: transferGroupId, paid_by_user_id: userId },
+    { profile_id: destinationId, amount, description, occurred_at: occurredAt, transaction_type: "transfer_in", source: "manual", transfer_group_id: transferGroupId, paid_by_user_id: userId },
   ]);
   check(error, "Nao foi possivel transferir");
   revalidatePath("/dashboard"); revalidatePath("/extrato");
@@ -1027,7 +1022,7 @@ export async function createProfileTransfer(formData: FormData) {
 
 export async function addFinancialAsset(formData: FormData) {
   const profileId = String(formData.get("profile_id") ?? "");
-  const supabase = await requireProfile(profileId);
+  const supabase = await requireProfileEditor(profileId);
   const name = String(formData.get("name") ?? "").trim();
   const currentValue = parseBRL(formData.get("current_value"));
   if (!name || currentValue < 0) fail("Preencha o bem e o valor atual.");
@@ -1043,7 +1038,7 @@ export async function addFinancialAsset(formData: FormData) {
 
 export async function deleteFinancialAsset(formData: FormData) {
   const profileId = String(formData.get("profile_id") ?? "");
-  const supabase = await requireProfile(profileId);
+  const supabase = await requireProfileEditor(profileId);
   const { error } = await supabase.from("financial_assets").delete()
     .eq("id", String(formData.get("id") ?? "")).eq("profile_id", profileId);
   check(error, "Nao foi possivel remover o item");
@@ -1061,7 +1056,7 @@ export async function joinProfileByCode(formData: FormData) {
 
 export async function regenerateProfileJoinCode(formData: FormData) {
   const profileId = String(formData.get("profile_id") ?? "");
-  const supabase = await requireProfile(profileId);
+  const supabase = await requireProfileOwner(profileId);
   const { error } = await supabase.rpc("fn_regenerate_profile_join_code", { p_profile_id: profileId });
   check(error, "Nao foi possivel renovar o codigo");
   revalidatePath("/familia");
@@ -1069,7 +1064,7 @@ export async function regenerateProfileJoinCode(formData: FormData) {
 
 export async function manageProfileMember(formData: FormData) {
   const profileId = String(formData.get("profile_id") ?? "");
-  const supabase = await requireProfile(profileId);
+  const supabase = await requireProfileOwner(profileId);
   const { error } = await supabase.rpc("fn_manage_profile_member", {
     p_profile_id: profileId, p_user_id: String(formData.get("user_id") ?? ""),
     p_action: String(formData.get("action_type") ?? "member"),
@@ -1080,7 +1075,7 @@ export async function manageProfileMember(formData: FormData) {
 
 export async function saveProfileSplitRules(formData: FormData) {
   const profileId = String(formData.get("profile_id") ?? "");
-  const supabase = await requireProfile(profileId);
+  const supabase = await requireProfileAdmin(profileId);
   const rows = formData.getAll("member_user_id").map(String).map((userId) => ({
     profile_id: profileId, user_id: userId,
     percentage: Number(formData.get(`percentage_${userId}`) ?? 0) / 100, updated_at: new Date().toISOString(),

@@ -19,7 +19,7 @@ export default async function AppLayout({ children }: { children: React.ReactNod
         const isActive = profile.id === active?.id;
         return <form action={switchProfile} key={profile.id}><input type="hidden" name="profileId" value={profile.id} /><input type="hidden" name="next" value="/dashboard" /><button type="submit" className={`profile-chip gap-2 ${isActive ? "profile-chip-active" : ""}`} aria-pressed={isActive}><span className="size-2.5 rounded-full border border-current/20" style={{ background: profile.color ?? "var(--brand)" }} />{profile.name}</button></form>;
       })}</div>
-      <DisplayControls initialTheme={(settings?.theme ?? "system") as Theme} initialHidden={Boolean(settings?.hide_values)} />
+      <DisplayControls key={active?.id ?? "none"} profileId={active?.id ?? ""} initialTheme={(settings?.theme ?? "system") as Theme} initialHidden={Boolean(settings?.hide_values)} />
       <Link href="/perfil" className="avatar-control" aria-label="Abrir perfil">{active?.name.slice(0, 1).toUpperCase() ?? "P"}</Link>
     </header>
     <main id="main-content" className="flex-1 px-4" tabIndex={-1}>

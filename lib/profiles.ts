@@ -22,9 +22,10 @@ export async function getContext() {
   const claims = claimsData?.claims;
   if (!claims) redirect("/login");
 
-  const { data } = await supabase
+  const { data, error } = await supabase
     .from("profiles")
     .select("id,name,type,color,monthly_income,profile_type,context_type");
+  if (error) throw new Error(`Não foi possível carregar seus espaços financeiros: ${error.message}`);
 
   // pessoal primeiro, Casa depois
   const profiles = ((data ?? []) as Profile[]).sort((a, b) =>

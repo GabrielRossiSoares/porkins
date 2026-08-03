@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { addTransaction } from "../actions";
+import { SubmitButton } from "../SubmitButton";
 
 type Option = { id: string; name: string };
 type Space = { id: string; name: string; contextType: string };
@@ -175,7 +176,7 @@ export function TransactionForm({
         )}
       </fieldset>
 
-      <button type="submit" className="btn" disabled={sharedPercentage > 100}>Salvar compra</button>
+      <SubmitButton disabled={sharedPercentage > 100} pendingLabel="Salvando compra...">Salvar compra</SubmitButton>
       <p className="text-xs text-muted text-center">As parcelas serão criadas mês a mês e os acertos aparecerão para cada participante.</p>
     </form>
   );

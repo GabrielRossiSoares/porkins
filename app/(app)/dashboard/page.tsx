@@ -3,7 +3,6 @@ import { redirect } from "next/navigation";
 import { brl, pct } from "@/lib/format";
 import { monthProgress, monthlyGoalNeed, safeToPlan, spendingPace } from "@/lib/financial-insights";
 import { getContext } from "@/lib/profiles";
-import { markProfileTransactionsReviewed } from "../actions";
 
 export const dynamic = "force-dynamic";
 
@@ -12,14 +11,25 @@ type Recurrence = { recurrence_key: string; label: string; average_amount: numbe
 type FutureTransaction = { id: string; description: string | null; amount: number; occurred_at: string; installment_number: number; installment_count: number };
 type Goal = { id: string; name: string; current_amount: number; target_amount: number; deadline: string | null; status: string; progresso: number };
 const pad = (value: number) => String(value).padStart(2, "0");
+const OBJECTIVE_HINTS: Record<string, { title: string; detail: string; href: string }> = {
+  "Diminuir dívidas": { title: "Acompanhar dívidas e acertos", detail: "Veja o que vence e priorize os valores em aberto.", href: "/acertos" },
+  "Juntar dinheiro": { title: "Fortalecer suas caixinhas", detail: "Acompanhe o valor necessário para cada meta.", href: "/caixinhas" },
+  "Investir": { title: "Manter o aporte do mês", detail: "Compare o que já foi investido com o seu planejamento.", href: "/caixinhas" },
+  "Controle financeiro": { title: "Revisar seus lançamentos", detail: "Mantenha categorias e contas organizadas.", href: "/extrato" },
+  "Gastar menos": { title: "Observar onde mais saiu dinheiro", detail: "Use o extrato para encontrar gastos que podem ser reduzidos.", href: "/extrato?tipo=gastos" },
+  "Equilibrar o orçamento": { title: "Ajustar o planejamento", detail: "Compare os limites com o ritmo atual do mês.", href: "/perfil?secao=planejamento" },
+  "Aumentar renda": { title: "Revisar suas fontes de renda", detail: "Atualize salário, extras e receitas previstas.", href: "/renda" },
+};
 
 export default async function Dashboard({ searchParams }: { searchParams: Promise<{ convite?: string; revisao?: string }> }) {
   const { supabase, active, userId } = await getContext();
   if (!active) return <p className="text-muted">Nenhum perfil encontrado.</p>;
   if (active.context_type === "business") redirect("/empresa");
   const params = await searchParams;
-  const { data: userSettings } = await supabase.from("profile_user_settings").select("dashboard_sections").eq("profile_id", active.id).eq("user_id", userId).maybeSingle();
+  const { data: userSettings } = await supabase.from("profile_user_settings").select("dashboard_sections,objectives").eq("profile_id", active.id).eq("user_id", userId).maybeSingle();
   const dashboard = (userSettings?.dashboard_sections ?? { attention: true, upcoming: true, planning: true, goals: true, context: true }) as Record<string, boolean>;
+  const selectedObjectives = (userSettings?.objectives ?? []) as string[];
+  const objectiveHint = selectedObjectives.map((objective) => OBJECTIVE_HINTS[objective]).find(Boolean);
   const now = new Date();
   const today = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
   const firstOfMonth = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-01`;
@@ -94,8 +104,10 @@ export default async function Dashboard({ searchParams }: { searchParams: Promis
       <dl className="metric-strip mt-4"><Metric label={isPersonal ? "Renda prevista" : "Entradas"} value={income} /><Metric label="Saiu" value={spent} /><Metric label="Já comprometido" value={committed} /></dl>
     </section>
 
+    {objectiveHint && <Link href={objectiveHint.href} className="card dashboard-context action-row"><StatusDot tone="neutral" /><span className="flex-1"><span className="eyebrow">Seu foco</span><strong className="block text-sm mt-0.5">{objectiveHint.title}</strong><span className="text-xs text-muted">{objectiveHint.detail}</span></span><span aria-hidden="true" className="text-muted">›</span></Link>}
+
     <section className="dashboard-attention" aria-labelledby="attention-title"><SectionTitle id="attention-title" title="Precisa de você" detail="Só mostramos o que pede uma decisão." /><div className="action-list mt-2">
-      {reviewCount > 0 && <div className="action-row"><StatusDot tone="attention" /><Link href="/extrato?tipo=revisar" className="flex-1 min-w-0"><strong className="block text-sm">{reviewCount} lançamento(s) para revisar</strong><span className="text-xs text-muted">{brl(reviewAmount)} aguardando confirmação</span></Link><form action={markProfileTransactionsReviewed}><input type="hidden" name="profile_id" value={active.id} /><input type="hidden" name="next" value="/dashboard" /><button className="quiet-action">Confirmar</button></form></div>}
+      {reviewCount > 0 && <div className="action-row"><StatusDot tone="attention" /><Link href="/extrato?tipo=revisar" className="flex-1 min-w-0"><strong className="block text-sm">{reviewCount} lançamento(s) para revisar</strong><span className="text-xs text-muted">{brl(reviewAmount)} aguardando confirmação individual</span></Link><Link href="/extrato?tipo=revisar" className="quiet-action">Revisar</Link></div>}
       {owed > 0 && <ActionRow href="/acertos" tone="attention" title={`Você tem ${brl(owed)} a acertar`} detail="Despesas compartilhadas pendentes" />}
       {receivable > 0 && <ActionRow href="/acertos" tone="good" title={`${brl(receivable)} a receber`} detail="Partes de outras pessoas ainda pendentes" />}
       {committed > 0 && <ActionRow href="/recorrencias" tone="neutral" title={`${brl(committed)} nos próximos 30 dias`} detail={`${future.length} parcela(s) e ${recurrences.length} recorrência(s)`} />}
