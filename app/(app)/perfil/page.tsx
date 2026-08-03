@@ -119,7 +119,7 @@ export default async function Perfil({
                 </form>
               </div>
             )}
-            <p className="text-[11px] text-muted">A releitura remove somente os lançamentos criados pelo Gmail e os recria com o parser atual. Lançamentos manuais e CSV não são alterados.</p>
+            <p className="text-[11px] text-muted">A releitura atualiza, mensagem por mensagem, os lançamentos dos últimos 14 dias. Se uma nova leitura falhar, o lançamento anterior é preservado.</p>
           </div>
 
           <details className="card">
